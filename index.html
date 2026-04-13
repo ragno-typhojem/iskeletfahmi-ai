@@ -248,38 +248,72 @@ function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
 function polyCenter(pts){ let sx=0,sy=0; for(const p of pts){sx+=p.x;sy+=p.y;} return {x:sx/pts.length,y:sy/pts.length}; }
 function landmarkPts(lm,indices){ return indices.map(i=>{const p=lm[i];return p?{x:p.x*W,y:p.y*H}:null;}).filter(Boolean); }
 
-// ── Background ─────────────────────────────────────────────────
-function drawBackground() {
-  if (xrayMode) {
-    ctx.fillStyle = '#000305';
-    ctx.fillRect(0,0,W,H);
-    // Film grain
-    ctx.save();
-    for(let i=0;i<800;i++){
-      const gx=Math.random()*W, gy=Math.random()*H;
-      const ga=Math.random()*0.04;
-      ctx.fillStyle=`rgba(180,220,180,${ga})`;
-      ctx.fillRect(gx,gy,1,1);
-    }
-    // Subtle phosphor vignette
-    const vig=ctx.createRadialGradient(W/2,H/2,H*0.2,W/2,H/2,H*0.8);
-    vig.addColorStop(0,'rgba(0,0,0,0)');
-    vig.addColorStop(1,'rgba(0,5,2,0.75)');
-    ctx.fillStyle=vig; ctx.fillRect(0,0,W,H);
-    ctx.restore();
-  } else {
-    ctx.fillStyle='#06060f'; ctx.fillRect(0,0,W,H);
-    ctx.save();
-    ctx.strokeStyle='rgba(60,90,160,0.09)'; ctx.lineWidth=0.5;
-    for(let x=0;x<W;x+=24){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
-    for(let y=0;y<H;y+=24){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
-    const vig=ctx.createRadialGradient(W/2,H/2,H*0.25,W/2,H/2,H*0.75);
-    vig.addColorStop(0,'rgba(0,0,0,0)'); vig.addColorStop(1,'rgba(0,0,5,0.6)');
-    ctx.fillStyle=vig; ctx.fillRect(0,0,W,H);
-    ctx.restore();
+// ── Offscreen Canvas Optimizasyonu ─────────────────────────────
+let bgCacheFleshy = null;
+let bgCacheXray = null;
+let cachedW = 0;
+let cachedH = 0;
+
+function createBackgroundCaches(w, h) {
+  // Boyut değişmediyse tekrar oluşturmaya gerek yok
+  if (w === cachedW && h === cachedH && bgCacheFleshy) return; 
+  cachedW = w; cachedH = h;
+
+  // 1. Fleshy (Izgaralı) Arkaplan Cache
+  bgCacheFleshy = document.createElement('canvas');
+  bgCacheFleshy.width = w; bgCacheFleshy.height = h;
+  const ctxF = bgCacheFleshy.getContext('2d', { alpha: false });
+  
+  ctxF.fillStyle = '#06060f'; 
+  ctxF.fillRect(0, 0, w, h);
+  ctxF.strokeStyle = 'rgba(60,90,160,0.09)'; 
+  ctxF.lineWidth = 0.5;
+  ctxF.beginPath();
+  for(let x=0; x<w; x+=24) { ctxF.moveTo(x, 0); ctxF.lineTo(x, h); }
+  for(let y=0; y<h; y+=24) { ctxF.moveTo(0, y); ctxF.lineTo(w, y); }
+  ctxF.stroke();
+  
+  const vigF = ctxF.createRadialGradient(w/2, h/2, h*0.25, w/2, h/2, h*0.75);
+  vigF.addColorStop(0, 'rgba(0,0,0,0)'); 
+  vigF.addColorStop(1, 'rgba(0,0,5,0.6)');
+  ctxF.fillStyle = vigF; 
+  ctxF.fillRect(0, 0, w, h);
+
+  // 2. X-Ray (Film Grain) Arkaplan Cache
+  bgCacheXray = document.createElement('canvas');
+  bgCacheXray.width = w; bgCacheXray.height = h;
+  const ctxX = bgCacheXray.getContext('2d', { alpha: false });
+  
+  ctxX.fillStyle = '#000305';
+  ctxX.fillRect(0, 0, w, h);
+  
+  // Artık tek sefer çizildiği için grain miktarını 800'den 3000'e çıkarıp daha iyi bir doku elde edebiliriz
+  for(let i=0; i<3000; i++) { 
+    const gx = Math.random() * w, gy = Math.random() * h;
+    const ga = Math.random() * 0.04;
+    ctxX.fillStyle = `rgba(180,220,180,${ga})`;
+    ctxX.fillRect(gx, gy, 1, 1);
   }
+  
+  const vigX = ctxX.createRadialGradient(w/2, h/2, h*0.2, w/2, h/2, h*0.8);
+  vigX.addColorStop(0, 'rgba(0,0,0,0)');
+  vigX.addColorStop(1, 'rgba(0,5,2,0.75)');
+  ctxX.fillStyle = vigX; 
+  ctxX.fillRect(0, 0, w, h);
 }
 
+// ── Background ─────────────────────────────────────────────────
+function drawBackground() {
+  // Canvas boyutu güncellendiyse (veya ilk çalışmada) cache'leri yenile
+  createBackgroundCaches(W, H);
+
+  // Hazır çizilmiş resmi tek hamlede ekrana bas
+  if (xrayMode) {
+    ctx.drawImage(bgCacheXray, 0, 0);
+  } else {
+    ctx.drawImage(bgCacheFleshy, 0, 0);
+  }
+}
 // ── Ghost ──────────────────────────────────────────────────────
 function drawGhost() {
   ctx.save();
