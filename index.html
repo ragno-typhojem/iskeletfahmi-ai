@@ -943,7 +943,6 @@ function drawGhost(){
 const TASKS_PKG_CANDIDATES=[
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm',
-  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest',
   'https://unpkg.com/@mediapipe/tasks-vision@0.10.14'
 ];
 const WASM_BASE='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
@@ -1114,13 +1113,25 @@ document.getElementById('metricsBtn').addEventListener('click',()=>{state.metric
 document.getElementById('qualityBtn').addEventListener('click',e=>{if(state.qualityMode==='auto'){state.qualityMode='high';state.detail='high';e.currentTarget.textContent='HIGH Q';UI.detail.textContent='LOCK/HIGH'}else if(state.qualityMode==='high'){state.qualityMode='low';state.detail='low';e.currentTarget.textContent='FAST Q';UI.detail.textContent='LOCK/FAST'}else{state.qualityMode='auto';e.currentTarget.textContent='AUTO Q';UI.detail.textContent='AUTO/'+(state.detail==='high'?'HIGH':'FAST')}toast('Render kalitesi: '+state.qualityMode.toUpperCase())});
 document.getElementById('multiBtn').addEventListener('click',async()=>{
   const btn=UI.multiBtn;
-  if(state.multi){state.multi=false;crowd.clear();multi.faceOn=true;setModeButtons();toast('Tek kisi modu (yuz + eller)');return}
-  if(!multi.ready){
-    btn.classList.add('busy');btn.textContent='YUKLE…';
-    const ok=await loadMulti();
-    btn.classList.remove('busy');btn.textContent='MULTI';
-    if(!ok){toast('Coklu motor yuklenemedi: '+(multi.lastError||'CDN/agla erisim sorunu').slice(0,90));return}
+  if(state.multi){
+    state.multi=false;crowd.clear();multi.faceOn=true;setModeButtons();
+    toast('Tek kisi modu (yuz + eller)');
+    await ensureHolistic();
+    return;
   }
+  // Holistic ile tasks-vision WASM'i asla ayni anda ayakta olmamali (Module cakismasi).
+  btn.classList.add('busy');btn.textContent='YUKLE…';
+  await teardownHolistic();
+  if(!multi.ready){
+    const ok=await loadMulti();
+    if(!ok){
+      btn.classList.remove('busy');btn.textContent='MULTI';
+      toast('Coklu motor yuklenemedi: '+(multi.lastError||'CDN/agla erisim sorunu').slice(0,90));
+      await ensureHolistic();
+      return;
+    }
+  }
+  btn.classList.remove('busy');btn.textContent='MULTI';
   crowd.clear();state.multi=true;state.processing=false;setModeButtons();
   toast('Coklu iskelet: en fazla '+MAX_PEOPLE+' kisi (el takibi kapali)');
 });
@@ -1155,24 +1166,45 @@ setModeButtons();
 applyMobilePanelDefault();
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){state.processing=false;state.frames=0;state.lastFps=performance.now();state.lastInference=0}});
 
+let holisticInstance=null,cameraInstance=null,holisticLoading=null;
+async function ensureHolistic(){
+  if(holisticInstance)return holisticInstance;
+  if(holisticLoading)return holisticLoading;
+  holisticLoading=(async()=>{
+    if(typeof Holistic==='undefined')throw new Error('Holistic CDN yuklenemedi');
+    const h=new Holistic({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1675471629/${f}`});
+    h.setOptions({modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,smoothSegmentation:false,refineFaceLandmarks:true,minDetectionConfidence:.58,minTrackingConfidence:.68});
+    h.onResults(onResults);
+    holisticInstance=h;return h;
+  })();
+  try{return await holisticLoading}finally{holisticLoading=null}
+}
+// Holistic (legacy Emscripten/WASM) ve tasks-vision (yeni Emscripten/WASM) ayni
+// sayfada birlikte YASAMAZ: ikisi de kendi 'Module' globalini kurar ve biri
+// digerinin bellek/ABI varsayimlarini bozar -> "Module.arguments has been
+// replaced" hatasi. Cozum: MULTI'ye gecerken Holistic'i tamamen kapatip
+// bellekten dusurmek, tek moda donunce tekrar canlandirmak.
+async function teardownHolistic(){
+  if(holisticInstance){try{holisticInstance.close?.()}catch(_){}holisticInstance=null}
+}
 async function init(){
   try{
-    if(typeof Holistic==='undefined'||typeof Camera==='undefined')throw new Error('MediaPipe CDN yüklenemedi');
-    setLoading(18,'HOLISTIC MODEL YÜKLENİYOR...');
-    const holistic=new Holistic({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1675471629/${f}`});
-    holistic.setOptions({modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,smoothSegmentation:false,refineFaceLandmarks:true,minDetectionConfidence:.58,minTrackingConfidence:.68});
-    holistic.onResults(onResults);setLoading(48,'KAMERA BAŞLATILIYOR...');
-    const camera=new Camera(video,{width:640,height:480,onFrame:async()=>{
+    if(typeof Camera==='undefined')throw new Error('MediaPipe kamera yardimcisi yuklenemedi');
+    setLoading(48,'KAMERA BAŞLATILIYOR...');
+    cameraInstance=new Camera(video,{width:640,height:480,onFrame:async()=>{
       if(document.hidden||state.processing)return;
       const now=performance.now(),minGap=state.detail==='low'?44:0;
       if(now-state.lastInference<minGap)return;state.lastInference=now;
       state.processing=true;
       try{
         if(state.multi&&multi.ready){runMulti();state.processing=false}
-        else await holistic.send({image:video});
+        else if(!state.multi){const h=await ensureHolistic();await h.send({image:video})}
+        else state.processing=false;   // multi acilirken gecici bosluk
       }catch(e){state.processing=false;console.error(e)}
     }});
-    await camera.start();setLoading(100,'HAZIR');
+    await cameraInstance.start();
+    if(!state.multi)await ensureHolistic();
+    setLoading(100,'HAZIR');
     setTimeout(()=>{UI.loading.style.opacity='0';setTimeout(()=>UI.loading.remove(),480)},220)
   }catch(err){console.error(err);setLoading(100,'KAMERA / MODEL HATASI');UI.permissionHelp.style.display='block';UI.loadMsg.style.color='var(--red)'}
 }
