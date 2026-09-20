@@ -249,7 +249,8 @@ const state={xray:false,showCamera:false,faceMode:true,qualityMode:'auto',detail
 const MAX_PEOPLE=4;
 // Her "aktor" kendi yumusatma + anatomik oturtma hafizasini tasir; coklu modda kisiler karismaz.
 function makeActor(id){return{id,fitShift:0,skullFrame:null,center:null,lastSeen:0,tag:0,
-  pose:new LandmarkStabilizer(.24),face:new LandmarkStabilizer(.22)}}
+  pose:new LandmarkStabilizer(.24,4),face:new LandmarkStabilizer(.22,10),
+  faceMiss:0,handMiss:0}}
 let actor={id:'solo',fitShift:0,skullFrame:null,center:null,lastSeen:0,tag:0};
 const soloActor=actor;
 const BASE={w:640,h:480};
@@ -266,9 +267,16 @@ function angle3(a,b,c){if(!a||!b||!c)return null;const v1={x:a.x-b.x,y:a.y-b.y},
 function cssVar(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
 
 class LandmarkStabilizer{
-  constructor(base=.38){this.base=base;this.prev=null}
+  // grace: veri gelmedigi kareler icin son bilinen sonucu ne kadar (kare sayisi)
+  // koruyacagimiz. MULTI'de yuz/el eslesmesi tek karelik jitter yuzunden
+  // kopabiliyor; bunu direkt 'kayboldu' saymak goz/el katmanini titretiyordu.
+  constructor(base=.38,grace=0){this.base=base;this.prev=null;this.grace=grace;this.missStreak=0}
   apply(next){
-    if(!next){this.prev=null;return null}
+    if(!next){
+      if(this.prev&&this.missStreak<this.grace){this.missStreak++;return this.prev}   // kisa kopmayi tolere et
+      this.prev=null;this.missStreak=0;return null;
+    }
+    this.missStreak=0;
     if(!this.prev||this.prev.length!==next.length){this.prev=next.map(p=>({...p}));return this.prev}
     const out=new Array(next.length);
     for(let i=0;i<next.length;i++){
@@ -1032,7 +1040,7 @@ function matchActors(poses){
 }
 function bestFaceFor(pose,faces,used){
   const nose=pose?.[0];if(!nose||!faces.length)return null;
-  let best=-1,bd=.13;
+  let best=-1,bd=.22;   // genisletildi: MULTI'de kisiler yan yana/hareketliyken eslesme kopmasin
   for(let i=0;i<faces.length;i++){
     if(used.has(i))continue;
     const f=faces[i],n=f[1]||f[4]||f[0];if(!n)continue;
@@ -1043,7 +1051,7 @@ function bestFaceFor(pose,faces,used){
 }
 function bestHandFor(pose,wristIdx,hands,used){
   const w=pose?.[wristIdx];if(!w||!hands.length)return null;
-  let best=-1,bd=.16;
+  let best=-1,bd=.26;   // genisletildi: bilek/el taban noktasi farkli modellerden geldigi icin daha toleransli olmali
   for(let i=0;i<hands.length;i++){
     if(used.has(i))continue;
     const h=hands[i],base=h[0];if(!base)continue;
@@ -1075,8 +1083,8 @@ function onEngineResults(pr,fr,hr){
     const rawFace=bestFaceFor(pose,faces,usedFace);
     const face=m.actor.face.apply(rawFace?rawFace.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
     const rawLH=bestHandFor(pose,15,hands,usedHand),rawRH=bestHandFor(pose,16,hands,usedHand);
-    const lh=(m.actor.lh||(m.actor.lh=new LandmarkStabilizer(.30))).apply(rawLH?rawLH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
-    const rh=(m.actor.rh||(m.actor.rh=new LandmarkStabilizer(.30))).apply(rawRH?rawRH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
+    const lh=(m.actor.lh||(m.actor.lh=new LandmarkStabilizer(.30,10))).apply(rawLH?rawLH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
+    const rh=(m.actor.rh||(m.actor.rh=new LandmarkStabilizer(.30,10))).apply(rawRH?rawRH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
     people.push({actor:m.actor,pose,face,lh,rh,z:torsoDepth(pose)});
   }
   people.sort((a,b)=>b.z-a.z);   // uzaktaki kisi once
@@ -1113,8 +1121,23 @@ function updateMetrics(pose){
 }
 function updateHUD(r){const set=(el,on)=>el.classList.toggle('on',!!on);set(UI.pose,r.poseLandmarks?.length);set(UI.face,r.faceLandmarks?.length);set(UI.lh,r.leftHandLandmarks?.length);set(UI.rh,r.rightHandLandmarks?.length);let n=0;for(const k of ['poseLandmarks','faceLandmarks','leftHandLandmarks','rightHandLandmarks'])n+=r[k]?.length||0;UI.lmCount.textContent=n}
 function updateFPS(){state.frames++;const now=performance.now(),dt=now-state.lastFps;if(dt>=1200){state.fps=Math.round(state.frames*1000/dt);UI.fps.textContent=state.fps;state.frames=0;state.lastFps=now;autoQuality(state.fps)}}
-function autoQuality(fps){if(state.qualityMode!=='auto')return;if(fps<23){state.lowFpsWindows++;state.highFpsWindows=0}else if(fps>31){state.highFpsWindows++;state.lowFpsWindows=0}else{state.lowFpsWindows=state.highFpsWindows=0}if(state.multi&&state.lowFpsWindows>=2&&engine.face&&engine.faceOn){engine.faceOn=false;state.lowFpsWindows=0;toast('Coklu mod: kafatasi katmani kapatildi (FPS)');return}
-if(state.lowFpsWindows>=2&&state.detail!=='low'){state.detail='low';UI.detail.textContent='AUTO/FAST';state.lowFpsWindows=0;toast('Detay otomatik azaltıldı')}else if(state.highFpsWindows>=3&&state.detail!=='high'){state.detail='high';UI.detail.textContent='AUTO/HIGH';state.highFpsWindows=0;toast('Yüksek detay geri açıldı')}}
+// NOT: kafatasi/el katmanini FPS dustugunde OTOMATIK KAPATMIYORUZ artik —
+// bu ozellik kullanicinin asil ihtiyaci oldugu icin MULTI'de daima acik kalmali.
+// FPS dusunce yerine once render detayini (state.detail) azaltiyoruz; bu,
+// kemik/kafatasi cizim inceligini dusurur ama hicbir katmani gizlemez.
+function autoQuality(fps){
+  if(state.qualityMode!=='auto')return;
+  if(fps<23){state.lowFpsWindows++;state.highFpsWindows=0}
+  else if(fps>31){state.highFpsWindows++;state.lowFpsWindows=0}
+  else{state.lowFpsWindows=state.highFpsWindows=0}
+  if(state.lowFpsWindows>=2&&state.detail!=='low'){
+    state.detail='low';UI.detail.textContent='AUTO/FAST';state.lowFpsWindows=0;
+    toast('Detay otomatik azaltıldı (yüz/eller açık kalıyor)');
+  }else if(state.highFpsWindows>=3&&state.detail!=='high'){
+    state.detail='high';UI.detail.textContent='AUTO/HIGH';state.highFpsWindows=0;
+    toast('Yüksek detay geri açıldı');
+  }
+}
 
 // onEngineResults artik hem tek-kisi hem coklu-kisi karesini isliyor; ayri bir
 // Holistic onResults yolu yok (tek WASM runtime kuralinin geregi).
