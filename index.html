@@ -224,7 +224,6 @@ body.fullscreen #app{width:min(100vw,133.333vh);height:auto;max-height:100vh;asp
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1675471629/holistic.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
 <script>
 'use strict';
@@ -283,7 +282,8 @@ class LandmarkStabilizer{
     this.prev=out;return out
   }
 }
-const smoothPose=new LandmarkStabilizer(.24),smoothFace=new LandmarkStabilizer(.22),smoothLH=new LandmarkStabilizer(.30),smoothRH=new LandmarkStabilizer(.30);
+// soloActor bazli tekli-kisi akisi artik onEngineResults uzerinden yuruyor;
+// ayri stabilizer/HUD fonksiyonlarina gerek kalmadi.
 
 let bgNormal=null,bgXray=null,bgW=0,bgH=0;
 function rebuildBackground(){
@@ -932,14 +932,13 @@ function drawGhost(){
   const cx=W*.5,cy=H*.48,s=H*.36;ctx.beginPath();ctx.ellipse(cx,cy-s*.78,s*.13,s*.17,0,0,Math.PI*2);ctx.moveTo(cx,cy-s*.61);ctx.lineTo(cx,cy+s*.08);ctx.moveTo(cx-s*.30,cy-s*.47);ctx.lineTo(cx+s*.30,cy-s*.47);ctx.moveTo(cx-s*.30,cy-s*.47);ctx.lineTo(cx-s*.36,cy+s*.10);ctx.moveTo(cx+s*.30,cy-s*.47);ctx.lineTo(cx+s*.36,cy+s*.10);ctx.moveTo(cx,cy+s*.08);ctx.lineTo(cx-s*.17,cy+s*.50);ctx.lineTo(cx-s*.15,cy+s*.93);ctx.moveTo(cx,cy+s*.08);ctx.lineTo(cx+s*.17,cy+s*.50);ctx.lineTo(cx+s*.15,cy+s*.93);ctx.stroke();ctx.restore()
 }
 
-/* ---------- COKLU KISI MOTORU (MediaPipe Tasks Vision) ---------- */
-/* Holistic tasarim geregi TEK kisi dondurur. Coklu iskelet icin ayri bir
-   PoseLandmarker (numPoses>1) + FaceLandmarker yuklenir; ayni cizim
-   fonksiyonlari kullanilir cunku landmark indeksleri ayni. */
-// NOT: '/vision_bundle.mjs' paket kokune eklenince jsDelivr 404 donuyor ve
-// dinamik import sessizce reddediliyor (Vercel'de bu, "MULTI hicbir sey yapmiyor" gibi gorunuyor).
-// Doğru yol: paket kokunu doğrudan ESM olarak import etmek. Birden fazla surum/CDN
-// fallback'i var cunku jsDelivr bazen tek bir yolu 404'leyebiliyor.
+/* ---------- TEK MOTOR: MediaPipe Tasks Vision (Pose + Face + Hands) ---------- */
+/* Eskiden Holistic (legacy Emscripten/WASM) ile tasks-vision (yeni Emscripten/WASM)
+   ayni sayfada bir aradaydi. Bu ikisi kendi 'Module' globalini kurdugu icin
+   birbirini bozup "Module.arguments has been replaced" hatasi veriyordu
+   (bkz. google-ai-edge/mediapipe#2823). Cozum: TEK runtime kullanmak.
+   Artik hem tek-kisi hem coklu-kisi modu ayni tasks-vision motorunu paylasiyor;
+   fark sadece numPoses/numFaces/numHands parametresinde. */
 const TASKS_PKG_CANDIDATES=[
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm',
@@ -948,7 +947,8 @@ const TASKS_PKG_CANDIDATES=[
 const WASM_BASE='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const POSE_MODEL='https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
 const FACE_MODEL='https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-const multi={pose:null,face:null,ts:0,ready:false,loading:false,faceOn:true,lastError:null};
+const HAND_MODEL='https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const engine={pose:null,face:null,hand:null,ts:0,ready:false,loading:null,faceOn:true,handOn:true,lastError:null,numPoses:1};
 const crowd=new Map();let crowdSeq=0;
 
 async function makeTask(factory,fileset,opts){
@@ -963,30 +963,45 @@ async function loadVisionModule(){
   }
   throw lastErr||new Error('tasks-vision hicbir CDN yolundan yuklenemedi');
 }
-async function loadMulti(){
-  if(multi.ready)return true;
-  if(multi.loading)return false;
-  multi.loading=true;multi.lastError=null;
-  try{
-    const mod=await loadVisionModule();
-    const fileset=await mod.FilesetResolver.forVisionTasks(WASM_BASE);
-    multi.pose=await makeTask(mod.PoseLandmarker,fileset,{
-      baseOptions:{modelAssetPath:POSE_MODEL,delegate:'GPU'},
-      runningMode:'VIDEO',numPoses:MAX_PEOPLE,
-      minPoseDetectionConfidence:.5,minPosePresenceConfidence:.5,minTrackingConfidence:.5
-    });
+async function loadEngine(numPoses){
+  if(engine.ready&&engine.numPoses===numPoses)return true;
+  if(engine.loading)return engine.loading;
+  engine.loading=(async()=>{
+    engine.lastError=null;
     try{
-      multi.face=await makeTask(mod.FaceLandmarker,fileset,{
-        baseOptions:{modelAssetPath:FACE_MODEL,delegate:'GPU'},
-        runningMode:'VIDEO',numFaces:MAX_PEOPLE,outputFaceBlendshapes:false,outputFacialTransformationMatrixes:false
+      // farkli numPoses icin PoseLandmarker'i yeniden kurmak gerekiyor; digerlerini tekrar indirmeye gerek yok
+      const mod=engine._mod||await loadVisionModule();engine._mod=mod;
+      const fileset=engine._fileset||await mod.FilesetResolver.forVisionTasks(WASM_BASE);engine._fileset=fileset;
+      if(engine.pose){try{engine.pose.close()}catch(_){}engine.pose=null}
+      engine.pose=await makeTask(mod.PoseLandmarker,fileset,{
+        baseOptions:{modelAssetPath:POSE_MODEL,delegate:'GPU'},
+        runningMode:'VIDEO',numPoses,
+        minPoseDetectionConfidence:.5,minPosePresenceConfidence:.5,minTrackingConfidence:.5
       });
-    }catch(e){multi.face=null;console.warn('FaceLandmarker yuklenemedi, kafatasi coklu modda pasif',e)}
-    multi.ready=true;multi.loading=false;return true;
-  }catch(err){
-    console.error('loadMulti basarisiz:',err);
-    multi.lastError=(err&&(err.message||String(err)))||'bilinmeyen hata';
-    multi.loading=false;multi.ready=false;return false;
-  }
+      if(!engine.face){
+        try{
+          engine.face=await makeTask(mod.FaceLandmarker,fileset,{
+            baseOptions:{modelAssetPath:FACE_MODEL,delegate:'GPU'},
+            runningMode:'VIDEO',numFaces:MAX_PEOPLE,outputFaceBlendshapes:false,outputFacialTransformationMatrixes:false
+          });
+        }catch(e){engine.face=null;console.warn('FaceLandmarker yuklenemedi',e)}
+      }
+      if(!engine.hand){
+        try{
+          engine.hand=await makeTask(mod.HandLandmarker,fileset,{
+            baseOptions:{modelAssetPath:HAND_MODEL,delegate:'GPU'},
+            runningMode:'VIDEO',numHands:MAX_PEOPLE*2
+          });
+        }catch(e){engine.hand=null;console.warn('HandLandmarker yuklenemedi',e)}
+      }
+      engine.numPoses=numPoses;engine.ready=true;return true;
+    }catch(err){
+      console.error('loadEngine basarisiz:',err);
+      engine.lastError=(err&&(err.message||String(err)))||'bilinmeyen hata';
+      engine.ready=false;return false;
+    }finally{engine.loading=null}
+  })();
+  return engine.loading;
 }
 function normTask(arr){
   let mx=0;for(const p of arr)mx=Math.max(mx,p.visibility??0);
@@ -1026,47 +1041,64 @@ function bestFaceFor(pose,faces,used){
   }
   if(best<0)return null;used.add(best);return faces[best];
 }
-function runMulti(){
-  if(!multi.ready||video.readyState<2)return;
-  const t=Math.max(multi.ts+1,Math.round(performance.now()));multi.ts=t;
-  let pr=null,fr=null;
-  try{pr=multi.pose.detectForVideo(video,t)}catch(e){console.error(e);return}
-  if(multi.face&&multi.faceOn){try{fr=multi.face.detectForVideo(video,t)}catch(e){fr=null}}
-  onMultiResults(pr,fr);
+function bestHandFor(pose,wristIdx,hands,used){
+  const w=pose?.[wristIdx];if(!w||!hands.length)return null;
+  let best=-1,bd=.16;
+  for(let i=0;i<hands.length;i++){
+    if(used.has(i))continue;
+    const h=hands[i],base=h[0];if(!base)continue;
+    const d=Math.hypot(base.x-w.x,base.y-w.y);
+    if(d<bd){bd=d;best=i}
+  }
+  if(best<0)return null;used.add(best);return hands[best];
+}
+function runEngine(){
+  if(!engine.ready||video.readyState<2)return;
+  const t=Math.max(engine.ts+1,Math.round(performance.now()));engine.ts=t;
+  let pr=null,fr=null,hr=null;
+  try{pr=engine.pose.detectForVideo(video,t)}catch(e){console.error(e);return}
+  if(engine.face&&engine.faceOn){try{fr=engine.face.detectForVideo(video,t)}catch(e){fr=null}}
+  if(engine.hand&&engine.handOn){try{hr=engine.hand.detectForVideo(video,t)}catch(e){hr=null}}
+  onEngineResults(pr,fr,hr);
 }
 const PERSON_COLORS=['#88d9d0','#d8b978','#8bd5a2','#c9a6e0'];
-function onMultiResults(pr,fr){
+function onEngineResults(pr,fr,hr){
   state.processing=false;updateFPS();syncCanvasSize();
   const rawPoses=(pr?.landmarks||[]).slice(0,MAX_PEOPLE).map(normTask);
   const faces=(fr?.faceLandmarks||[]);
+  const hands=(hr?.landmarks||[]);
   const matched=matchActors(rawPoses);
-  const usedFace=new Set();
+  const usedFace=new Set(),usedHand=new Set();
   const people=[];
   for(const m of matched){
     const pose=m.actor.pose.apply(m.pose);
     const rawFace=bestFaceFor(pose,faces,usedFace);
     const face=m.actor.face.apply(rawFace?rawFace.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
-    people.push({actor:m.actor,pose,face,z:torsoDepth(pose)});
+    const rawLH=bestHandFor(pose,15,hands,usedHand),rawRH=bestHandFor(pose,16,hands,usedHand);
+    const lh=(m.actor.lh||(m.actor.lh=new LandmarkStabilizer(.30))).apply(rawLH?rawLH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
+    const rh=(m.actor.rh||(m.actor.rh=new LandmarkStabilizer(.30))).apply(rawRH?rawRH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
+    people.push({actor:m.actor,pose,face,lh,rh,z:torsoDepth(pose)});
   }
   people.sort((a,b)=>b.z-a.z);   // uzaktaki kisi once
   mainCtx.clearRect(0,0,W,H);drawBackground();
   if(people.length){
     renderLayer(()=>{
-      for(const p of people){actor=p.actor;drawSkeleton(p.pose,p.face,null,null)}
+      for(const p of people){actor=p.actor;drawSkeleton(p.pose,p.face,p.lh,p.rh)}
       actor=soloActor;
     });
-    for(const p of people){
+    if(state.multi)for(const p of people){
       const head=p.pose?.[0],tag=p.actor.tag||1;
       if(head)drawTag(head.x*W,head.y*H-H*.09,'#'+tag,PERSON_COLORS[(tag-1)%PERSON_COLORS.length]);
     }
   }else drawGhost();
   state.peopleCount=people.length;
   const set=(el,on)=>el.classList.toggle('on',!!on);
-  set(UI.pose,people.length);set(UI.face,usedFace.size);set(UI.lh,false);set(UI.rh,false);
-  let n=0;for(const p of people){n+=p.pose?.length||0;n+=p.face?.length||0}
+  const p0=people[0];
+  set(UI.pose,people.length);set(UI.face,usedFace.size);set(UI.lh,!!p0?.lh);set(UI.rh,!!p0?.rh);
+  let n=0;for(const p of people){n+=p.pose?.length||0;n+=p.face?.length||0;n+=p.lh?.length||0;n+=p.rh?.length||0}
   UI.lmCount.textContent=n;UI.people.textContent=people.length;
   if(state.metrics&&state.frames%3===0){
-    updateMetrics(people[0]?.pose||null);
+    updateMetrics(p0?.pose||null);
     if(people.length>1)UI.state.textContent='MULTI x'+people.length;
   }
 }
@@ -1081,21 +1113,11 @@ function updateMetrics(pose){
 }
 function updateHUD(r){const set=(el,on)=>el.classList.toggle('on',!!on);set(UI.pose,r.poseLandmarks?.length);set(UI.face,r.faceLandmarks?.length);set(UI.lh,r.leftHandLandmarks?.length);set(UI.rh,r.rightHandLandmarks?.length);let n=0;for(const k of ['poseLandmarks','faceLandmarks','leftHandLandmarks','rightHandLandmarks'])n+=r[k]?.length||0;UI.lmCount.textContent=n}
 function updateFPS(){state.frames++;const now=performance.now(),dt=now-state.lastFps;if(dt>=1200){state.fps=Math.round(state.frames*1000/dt);UI.fps.textContent=state.fps;state.frames=0;state.lastFps=now;autoQuality(state.fps)}}
-function autoQuality(fps){if(state.qualityMode!=='auto')return;if(fps<23){state.lowFpsWindows++;state.highFpsWindows=0}else if(fps>31){state.highFpsWindows++;state.lowFpsWindows=0}else{state.lowFpsWindows=state.highFpsWindows=0}if(state.multi&&state.lowFpsWindows>=2&&multi.face&&multi.faceOn){multi.faceOn=false;state.lowFpsWindows=0;toast('Coklu mod: kafatasi katmani kapatildi (FPS)');return}
+function autoQuality(fps){if(state.qualityMode!=='auto')return;if(fps<23){state.lowFpsWindows++;state.highFpsWindows=0}else if(fps>31){state.highFpsWindows++;state.lowFpsWindows=0}else{state.lowFpsWindows=state.highFpsWindows=0}if(state.multi&&state.lowFpsWindows>=2&&engine.face&&engine.faceOn){engine.faceOn=false;state.lowFpsWindows=0;toast('Coklu mod: kafatasi katmani kapatildi (FPS)');return}
 if(state.lowFpsWindows>=2&&state.detail!=='low'){state.detail='low';UI.detail.textContent='AUTO/FAST';state.lowFpsWindows=0;toast('Detay otomatik azaltıldı')}else if(state.highFpsWindows>=3&&state.detail!=='high'){state.detail='high';UI.detail.textContent='AUTO/HIGH';state.highFpsWindows=0;toast('Yüksek detay geri açıldı')}}
 
-function onResults(raw){
-  state.processing=false;
-  if(state.multi)return;                 // coklu moda gecildiyse geciken Holistic karesini yoksay
-  updateFPS();syncCanvasSize();actor=soloActor;
-  const r={...raw,poseLandmarks:smoothPose.apply(raw.poseLandmarks),faceLandmarks:smoothFace.apply(raw.faceLandmarks),leftHandLandmarks:smoothLH.apply(raw.leftHandLandmarks),rightHandLandmarks:smoothRH.apply(raw.rightHandLandmarks)};
-  state.lastResults=r;mainCtx.clearRect(0,0,W,H);drawBackground();
-  const any=r.poseLandmarks||r.faceLandmarks||r.leftHandLandmarks||r.rightHandLandmarks;
-  if(any)renderLayer(()=>drawSkeleton(r.poseLandmarks,r.faceLandmarks,r.leftHandLandmarks,r.rightHandLandmarks));
-  else drawGhost();
-  state.peopleCount=any?1:0;UI.people.textContent=state.peopleCount;
-  updateHUD(r);if(state.metrics&&state.frames%3===0)updateMetrics(r.poseLandmarks)
-}
+// onEngineResults artik hem tek-kisi hem coklu-kisi karesini isliyor; ayri bir
+// Holistic onResults yolu yok (tek WASM runtime kuralinin geregi).
 
 function setModeButtons(){
   document.getElementById('xrayBtn').classList.toggle('active',state.xray);
@@ -1114,26 +1136,21 @@ document.getElementById('qualityBtn').addEventListener('click',e=>{if(state.qual
 document.getElementById('multiBtn').addEventListener('click',async()=>{
   const btn=UI.multiBtn;
   if(state.multi){
-    state.multi=false;crowd.clear();multi.faceOn=true;setModeButtons();
+    btn.classList.add('busy');btn.textContent='YUKLE…';
+    crowd.clear();state.multi=false;
+    const ok=await loadEngine(1);   // tek kisiye donerken PoseLandmarker'i numPoses:1 ile yeniden kur
+    btn.classList.remove('busy');btn.textContent='MULTI';
+    if(!ok)toast('Tek kisi motoru yeniden kurulamadi: '+(engine.lastError||'').slice(0,80));
+    engine.faceOn=true;engine.handOn=true;setModeButtons();
     toast('Tek kisi modu (yuz + eller)');
-    await ensureHolistic();
     return;
   }
-  // Holistic ile tasks-vision WASM'i asla ayni anda ayakta olmamali (Module cakismasi).
   btn.classList.add('busy');btn.textContent='YUKLE…';
-  await teardownHolistic();
-  if(!multi.ready){
-    const ok=await loadMulti();
-    if(!ok){
-      btn.classList.remove('busy');btn.textContent='MULTI';
-      toast('Coklu motor yuklenemedi: '+(multi.lastError||'CDN/agla erisim sorunu').slice(0,90));
-      await ensureHolistic();
-      return;
-    }
-  }
+  const ok=await loadEngine(MAX_PEOPLE);
   btn.classList.remove('busy');btn.textContent='MULTI';
+  if(!ok){toast('Coklu motor yuklenemedi: '+(engine.lastError||'CDN/agla erisim sorunu').slice(0,90));return}
   crowd.clear();state.multi=true;state.processing=false;setModeButtons();
-  toast('Coklu iskelet: en fazla '+MAX_PEOPLE+' kisi (el takibi kapali)');
+  toast('Coklu iskelet: en fazla '+MAX_PEOPLE+' kisi');
 });
 document.getElementById('realBtn').addEventListener('click',()=>{state.realism=!state.realism;setModeButtons();toast(state.realism?'Gerceklik katmani acik (golge + doku)':'Duz render')});
 document.getElementById('shotBtn').addEventListener('click',()=>{
@@ -1166,44 +1183,22 @@ setModeButtons();
 applyMobilePanelDefault();
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){state.processing=false;state.frames=0;state.lastFps=performance.now();state.lastInference=0}});
 
-let holisticInstance=null,cameraInstance=null,holisticLoading=null;
-async function ensureHolistic(){
-  if(holisticInstance)return holisticInstance;
-  if(holisticLoading)return holisticLoading;
-  holisticLoading=(async()=>{
-    if(typeof Holistic==='undefined')throw new Error('Holistic CDN yuklenemedi');
-    const h=new Holistic({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/holistic@0.5.1675471629/${f}`});
-    h.setOptions({modelComplexity:1,smoothLandmarks:true,enableSegmentation:false,smoothSegmentation:false,refineFaceLandmarks:true,minDetectionConfidence:.58,minTrackingConfidence:.68});
-    h.onResults(onResults);
-    holisticInstance=h;return h;
-  })();
-  try{return await holisticLoading}finally{holisticLoading=null}
-}
-// Holistic (legacy Emscripten/WASM) ve tasks-vision (yeni Emscripten/WASM) ayni
-// sayfada birlikte YASAMAZ: ikisi de kendi 'Module' globalini kurar ve biri
-// digerinin bellek/ABI varsayimlarini bozar -> "Module.arguments has been
-// replaced" hatasi. Cozum: MULTI'ye gecerken Holistic'i tamamen kapatip
-// bellekten dusurmek, tek moda donunce tekrar canlandirmak.
-async function teardownHolistic(){
-  if(holisticInstance){try{holisticInstance.close?.()}catch(_){}holisticInstance=null}
-}
+let cameraInstance=null;
 async function init(){
   try{
     if(typeof Camera==='undefined')throw new Error('MediaPipe kamera yardimcisi yuklenemedi');
-    setLoading(48,'KAMERA BAŞLATILIYOR...');
+    setLoading(18,'GORME MOTORU YÜKLENİYOR...');
+    const ok=await loadEngine(1);
+    if(!ok)throw new Error(engine.lastError||'Gorme motoru yuklenemedi');
+    setLoading(55,'KAMERA BAŞLATILIYOR...');
     cameraInstance=new Camera(video,{width:640,height:480,onFrame:async()=>{
       if(document.hidden||state.processing)return;
       const now=performance.now(),minGap=state.detail==='low'?44:0;
       if(now-state.lastInference<minGap)return;state.lastInference=now;
       state.processing=true;
-      try{
-        if(state.multi&&multi.ready){runMulti();state.processing=false}
-        else if(!state.multi){const h=await ensureHolistic();await h.send({image:video})}
-        else state.processing=false;   // multi acilirken gecici bosluk
-      }catch(e){state.processing=false;console.error(e)}
+      try{runEngine()}catch(e){console.error(e)}finally{state.processing=false}
     }});
     await cameraInstance.start();
-    if(!state.multi)await ensureHolistic();
     setLoading(100,'HAZIR');
     setTimeout(()=>{UI.loading.style.opacity='0';setTimeout(()=>UI.loading.remove(),480)},220)
   }catch(err){console.error(err);setLoading(100,'KAMERA / MODEL HATASI');UI.permissionHelp.style.display='block';UI.loadMsg.style.color='var(--red)'}
