@@ -936,25 +936,41 @@ function drawGhost(){
 /* Holistic tasarim geregi TEK kisi dondurur. Coklu iskelet icin ayri bir
    PoseLandmarker (numPoses>1) + FaceLandmarker yuklenir; ayni cizim
    fonksiyonlari kullanilir cunku landmark indeksleri ayni. */
-const TASKS_CDN='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+// NOT: '/vision_bundle.mjs' paket kokune eklenince jsDelivr 404 donuyor ve
+// dinamik import sessizce reddediliyor (Vercel'de bu, "MULTI hicbir sey yapmiyor" gibi gorunuyor).
+// Doğru yol: paket kokunu doğrudan ESM olarak import etmek. Birden fazla surum/CDN
+// fallback'i var cunku jsDelivr bazen tek bir yolu 404'leyebiliyor.
+const TASKS_PKG_CANDIDATES=[
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm',
+  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest',
+  'https://unpkg.com/@mediapipe/tasks-vision@0.10.14'
+];
+const WASM_BASE='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const POSE_MODEL='https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
 const FACE_MODEL='https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
-const multi={pose:null,face:null,ts:0,ready:false,loading:false,faceOn:true};
+const multi={pose:null,face:null,ts:0,ready:false,loading:false,faceOn:true,lastError:null};
 const crowd=new Map();let crowdSeq=0;
 
 async function makeTask(factory,fileset,opts){
   try{return await factory.createFromOptions(fileset,opts)}
   catch(e){return await factory.createFromOptions(fileset,{...opts,baseOptions:{...opts.baseOptions,delegate:'CPU'}})}
 }
+async function loadVisionModule(){
+  let lastErr=null;
+  for(const url of TASKS_PKG_CANDIDATES){
+    try{const mod=await import(/* webpackIgnore: true */ url);if(mod?.FilesetResolver)return mod}
+    catch(e){lastErr=e;console.warn('tasks-vision import basarisiz:',url,e?.message||e)}
+  }
+  throw lastErr||new Error('tasks-vision hicbir CDN yolundan yuklenemedi');
+}
 async function loadMulti(){
   if(multi.ready)return true;
   if(multi.loading)return false;
-  multi.loading=true;
+  multi.loading=true;multi.lastError=null;
   try{
-    let mod;
-    try{mod=await import(TASKS_CDN+'/vision_bundle.mjs')}
-    catch(_){mod=await import(TASKS_CDN+'/+esm')}
-    const fileset=await mod.FilesetResolver.forVisionTasks(TASKS_CDN+'/wasm');
+    const mod=await loadVisionModule();
+    const fileset=await mod.FilesetResolver.forVisionTasks(WASM_BASE);
     multi.pose=await makeTask(mod.PoseLandmarker,fileset,{
       baseOptions:{modelAssetPath:POSE_MODEL,delegate:'GPU'},
       runningMode:'VIDEO',numPoses:MAX_PEOPLE,
@@ -967,7 +983,11 @@ async function loadMulti(){
       });
     }catch(e){multi.face=null;console.warn('FaceLandmarker yuklenemedi, kafatasi coklu modda pasif',e)}
     multi.ready=true;multi.loading=false;return true;
-  }catch(err){console.error(err);multi.loading=false;multi.ready=false;return false}
+  }catch(err){
+    console.error('loadMulti basarisiz:',err);
+    multi.lastError=(err&&(err.message||String(err)))||'bilinmeyen hata';
+    multi.loading=false;multi.ready=false;return false;
+  }
 }
 function normTask(arr){
   let mx=0;for(const p of arr)mx=Math.max(mx,p.visibility??0);
@@ -1099,7 +1119,7 @@ document.getElementById('multiBtn').addEventListener('click',async()=>{
     btn.classList.add('busy');btn.textContent='YUKLE…';
     const ok=await loadMulti();
     btn.classList.remove('busy');btn.textContent='MULTI';
-    if(!ok){toast('Coklu motor yuklenemedi (internet/CDN gerekli)');return}
+    if(!ok){toast('Coklu motor yuklenemedi: '+(multi.lastError||'CDN/agla erisim sorunu').slice(0,90));return}
   }
   crowd.clear();state.multi=true;state.processing=false;setModeButtons();
   toast('Coklu iskelet: en fazla '+MAX_PEOPLE+' kisi (el takibi kapali)');
