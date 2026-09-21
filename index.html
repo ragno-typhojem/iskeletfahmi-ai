@@ -249,7 +249,7 @@ const state={xray:false,showCamera:false,faceMode:true,qualityMode:'auto',detail
 const MAX_PEOPLE=4;
 // Her "aktor" kendi yumusatma + anatomik oturtma hafizasini tasir; coklu modda kisiler karismaz.
 function makeActor(id){return{id,fitShift:0,skullFrame:null,center:null,lastSeen:0,tag:0,
-  pose:new LandmarkStabilizer(.24,4),face:new LandmarkStabilizer(.22,10),
+  pose:new LandmarkStabilizer(.34,4),face:new LandmarkStabilizer(.30,6),
   faceMiss:0,handMiss:0}}
 let actor={id:'solo',fitShift:0,skullFrame:null,center:null,lastSeen:0,tag:0};
 const soloActor=actor;
@@ -267,24 +267,28 @@ function angle3(a,b,c){if(!a||!b||!c)return null;const v1={x:a.x-b.x,y:a.y-b.y},
 function cssVar(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim()}
 
 class LandmarkStabilizer{
-  // grace: veri gelmedigi kareler icin son bilinen sonucu ne kadar (kare sayisi)
-  // koruyacagimiz. MULTI'de yuz/el eslesmesi tek karelik jitter yuzunden
-  // kopabiliyor; bunu direkt 'kayboldu' saymak goz/el katmanini titretiyordu.
-  constructor(base=.38,grace=0){this.base=base;this.prev=null;this.grace=grace;this.missStreak=0}
+  // grace: veri gelmedigi kareler icin son konumu KISA SURE korur, ama artik
+  // donuk durmuyor: her kayip karede fade (0..1) kademeli dusuyor, cizim
+  // fonksiyonlari bunu alpha olarak kullanip elin/yuzun sonup gitmesini
+  // sagliyor. Boylece ne ani kaybolma (pop) ne de donup asili kalma oluyor.
+  constructor(base=.38,grace=0){this.base=base;this.prev=null;this.grace=grace;this.missStreak=0;this.fade=1}
   apply(next){
     if(!next){
-      if(this.prev&&this.missStreak<this.grace){this.missStreak++;return this.prev}   // kisa kopmayi tolere et
-      this.prev=null;this.missStreak=0;return null;
+      if(this.prev&&this.missStreak<this.grace){
+        this.missStreak++;
+        this.fade=clamp(1-this.missStreak/this.grace,0,1);
+        return this.prev;
+      }
+      this.prev=null;this.missStreak=0;this.fade=0;return null;
     }
-    this.missStreak=0;
-    if(!this.prev||this.prev.length!==next.length){this.prev=next.map(p=>({...p}));return this.prev}
+    this.missStreak=0;this.fade=lerp(this.fade,1,.35);
+    if(!this.prev||this.prev.length!==next.length){this.prev=next.map(p=>({...p}));this.fade=1;return this.prev}
     const out=new Array(next.length);
     for(let i=0;i<next.length;i++){
       const n=next[i],p=this.prev[i];
       if(!n){out[i]=p;continue}
       const motion=p?Math.hypot(n.x-p.x,n.y-p.y):1;
-      const visibility=n.visibility??1;
-      const a=clamp(this.base+motion*7+(visibility<.4?.08:0),.18,.82);
+      const a=clamp(this.base+motion*11,.30,.90);
       out[i]={x:lerp(p.x,n.x,a),y:lerp(p.y,n.y,a),z:lerp(p.z||0,n.z||0,a),visibility:n.visibility??p.visibility??1};
     }
     this.prev=out;return out
@@ -624,8 +628,13 @@ function smoothPath(pts,tension=.28,close=true){
   if(close)ctx.closePath()
 }
 function eyeBounds(pts){const xs=pts.map(p=>p.x),ys=pts.map(p=>p.y);return{cx:(Math.min(...xs)+Math.max(...xs))/2,cy:(Math.min(...ys)+Math.max(...ys))/2,rx:(Math.max(...xs)-Math.min(...xs))*0.52,ry:(Math.max(...ys)-Math.min(...ys))*0.62}}
-function drawHumanFace(lm){
-  if(!lm||state.xray)return;
+function drawHumanFace(lm,alpha=1){
+  if(!lm||state.xray||alpha<=.02)return;
+  ctx.save();ctx.globalAlpha=alpha;
+  drawHumanFaceInner(lm);
+  ctx.restore();
+}
+function drawHumanFaceInner(lm){
   const ovalPts=landmarkPts(lm,FACE_OVAL);if(ovalPts.length<12)return;
   const fc=polyCenter(ovalPts),b=bounds(ovalPts),ovalW=b.w,ovalH=b.h;
   ctx.save();
@@ -854,8 +863,8 @@ function drawSkull(lm,frame,strength=1){
 }
 
 const HAND_CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
-function drawHand(lm){if(!lm)return;for(const [i,j] of HAND_CONN){const a=normPoint(lm,i),b=normPoint(lm,j);if(!a||!b)continue;const L=dist(a,b),r=clamp(L*.12,.65,2.05);drawBone(a,b,r,.92,{ep:1.05})}}
-function drawSkeleton(pose,face,lh,rh){
+function drawHand(lm,alpha=1){if(!lm||alpha<=.02)return;for(const [i,j] of HAND_CONN){const a=normPoint(lm,i),b=normPoint(lm,j);if(!a||!b)continue;const L=dist(a,b),r=clamp(L*.12,.65,2.05);drawBone(a,b,r,.92*alpha,{ep:1.05})}}
+function drawSkeleton(pose,face,lh,rh,faceAlpha=1,lhAlpha=1,rhAlpha=1){
   const frame=pose?buildBodyFrame(pose,face):null;
   // Cizim sirasi = derinlik sirasi: uzak uzuvlar -> govde -> yakin uzuvlar -> kafa -> eller.
   if(pose){
@@ -863,8 +872,11 @@ function drawSkeleton(pose,face,lh,rh){
     drawRibcage(pose,frame);drawPelvis(pose,frame);drawCervicalSpine(frame);
     drawLimbs(pose,frame,'near');
   }
-  if(face){drawSkull(face,frame,(state.faceMode&&!state.xray)?.74:1);if(state.faceMode&&!state.xray)drawHumanFace(face,frame)}
-  if(lh)drawHand(lh);if(rh)drawHand(rh)
+  if(face&&faceAlpha>.02){
+    drawSkull(face,frame,((state.faceMode&&!state.xray)?.74:1)*faceAlpha);
+    if(state.faceMode&&!state.xray)drawHumanFace(face,frame,faceAlpha);
+  }
+  if(lh)drawHand(lh,lhAlpha);if(rh)drawHand(rh,rhAlpha);
 }
 
 /* ---------- KOMPOZIT KATMAN: golge + kemik dokusu ---------- */
@@ -977,7 +989,9 @@ async function loadEngine(numPoses){
   engine.loading=(async()=>{
     engine.lastError=null;
     try{
-      // farkli numPoses icin PoseLandmarker'i yeniden kurmak gerekiyor; digerlerini tekrar indirmeye gerek yok
+      // PERFORMANS: numFaces/numHands sabit MAX_PEOPLE ile kurulmustu -> solo modda bile
+      // motor 4 yuz + 8 el aramaya calisiyordu, bu da her karede gereksiz gecikme demekti.
+      // Artik numPoses'a gore olcekleniyor ve mod degisince (solo<->multi) yeniden kuruluyor.
       const mod=engine._mod||await loadVisionModule();engine._mod=mod;
       const fileset=engine._fileset||await mod.FilesetResolver.forVisionTasks(WASM_BASE);engine._fileset=fileset;
       if(engine.pose){try{engine.pose.close()}catch(_){}engine.pose=null}
@@ -986,22 +1000,20 @@ async function loadEngine(numPoses){
         runningMode:'VIDEO',numPoses,
         minPoseDetectionConfidence:.5,minPosePresenceConfidence:.5,minTrackingConfidence:.5
       });
-      if(!engine.face){
-        try{
-          engine.face=await makeTask(mod.FaceLandmarker,fileset,{
-            baseOptions:{modelAssetPath:FACE_MODEL,delegate:'GPU'},
-            runningMode:'VIDEO',numFaces:MAX_PEOPLE,outputFaceBlendshapes:false,outputFacialTransformationMatrixes:false
-          });
-        }catch(e){engine.face=null;console.warn('FaceLandmarker yuklenemedi',e)}
-      }
-      if(!engine.hand){
-        try{
-          engine.hand=await makeTask(mod.HandLandmarker,fileset,{
-            baseOptions:{modelAssetPath:HAND_MODEL,delegate:'GPU'},
-            runningMode:'VIDEO',numHands:MAX_PEOPLE*2
-          });
-        }catch(e){engine.hand=null;console.warn('HandLandmarker yuklenemedi',e)}
-      }
+      if(engine.face){try{engine.face.close()}catch(_){}engine.face=null}
+      try{
+        engine.face=await makeTask(mod.FaceLandmarker,fileset,{
+          baseOptions:{modelAssetPath:FACE_MODEL,delegate:'GPU'},
+          runningMode:'VIDEO',numFaces:numPoses,outputFaceBlendshapes:false,outputFacialTransformationMatrixes:false
+        });
+      }catch(e){engine.face=null;console.warn('FaceLandmarker yuklenemedi',e)}
+      if(engine.hand){try{engine.hand.close()}catch(_){}engine.hand=null}
+      try{
+        engine.hand=await makeTask(mod.HandLandmarker,fileset,{
+          baseOptions:{modelAssetPath:HAND_MODEL,delegate:'GPU'},
+          runningMode:'VIDEO',numHands:numPoses*2
+        });
+      }catch(e){engine.hand=null;console.warn('HandLandmarker yuklenemedi',e)}
       engine.numPoses=numPoses;engine.ready=true;return true;
     }catch(err){
       console.error('loadEngine basarisiz:',err);
@@ -1083,15 +1095,17 @@ function onEngineResults(pr,fr,hr){
     const rawFace=bestFaceFor(pose,faces,usedFace);
     const face=m.actor.face.apply(rawFace?rawFace.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
     const rawLH=bestHandFor(pose,15,hands,usedHand),rawRH=bestHandFor(pose,16,hands,usedHand);
-    const lh=(m.actor.lh||(m.actor.lh=new LandmarkStabilizer(.30,10))).apply(rawLH?rawLH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
-    const rh=(m.actor.rh||(m.actor.rh=new LandmarkStabilizer(.30,10))).apply(rawRH?rawRH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
-    people.push({actor:m.actor,pose,face,lh,rh,z:torsoDepth(pose)});
+    const lh=(m.actor.lh||(m.actor.lh=new LandmarkStabilizer(.46,6))).apply(rawLH?rawLH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
+    const rh=(m.actor.rh||(m.actor.rh=new LandmarkStabilizer(.46,6))).apply(rawRH?rawRH.map(q=>({x:q.x,y:q.y,z:q.z||0,visibility:1})):null);
+    people.push({actor:m.actor,pose,face,lh,rh,
+      faceAlpha:m.actor.face.fade??1,lhAlpha:m.actor.lh?.fade??1,rhAlpha:m.actor.rh?.fade??1,
+      z:torsoDepth(pose)});
   }
   people.sort((a,b)=>b.z-a.z);   // uzaktaki kisi once
   mainCtx.clearRect(0,0,W,H);drawBackground();
   if(people.length){
     renderLayer(()=>{
-      for(const p of people){actor=p.actor;drawSkeleton(p.pose,p.face,p.lh,p.rh)}
+      for(const p of people){actor=p.actor;drawSkeleton(p.pose,p.face,p.lh,p.rh,p.faceAlpha,p.lhAlpha,p.rhAlpha)}
       actor=soloActor;
     });
     if(state.multi)for(const p of people){
